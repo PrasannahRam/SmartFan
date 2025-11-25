@@ -1,9 +1,11 @@
+import requests
 import RPi.GPIO as GPIO
 import time
-import cv2
-from ultralytics import YOLO
 import adafruit_dht
 import board
+
+
+print("Starting Smart Fan System...")
 
 # -------------------------------
 # GPIO setup
@@ -11,12 +13,13 @@ import board
 GPIO.setmode(GPIO.BCM)
 
 # -------------------------------
-# PWM Fan module setup (6-terminal)
+# PWM Fan setup
 # -------------------------------
-FAN_PWM_PIN = 18  # Connect this to VTRIG/PWM on your PWM module
+FAN_PWM_PIN = 18
 GPIO.setup(FAN_PWM_PIN, GPIO.OUT)
-fan_pwm = GPIO.PWM(FAN_PWM_PIN, 100)  # 100 Hz PWM frequency
-fan_pwm.start(0)  # Start with fan OFF
+fan_pwm = GPIO.PWM(FAN_PWM_PIN, 100)  # 100 Hz
+fan_pwm.start(0)
+fan_last_duty = 0
 
 # -------------------------------
 # Ultrasonic sensor (HC-SR04)
@@ -35,31 +38,31 @@ GPIO.setup(PIR_PIN, GPIO.IN)
 # -------------------------------
 # DHT22 temperature sensor
 # -------------------------------
-dht_sensor = adafruit_dht.DHT22(board.D4)
+dht_sensor = adafruit_dht.DHT22(board.D4, use_pulseio=False)
 
 # -------------------------------
-# YOLO model for human detection
+# Remote YOLO backend
 # -------------------------------
-model = YOLO('yolov8n.pt')
-
 recheck_interval = 10
 last_detected_time = 0
+
+
 # -------------------------------
 # Helper functions
 # -------------------------------
 def get_distance():
-    """Measure distance from HC-SR04 (cm). Returns None if failed."""
     GPIO.output(TRIG, True)
     time.sleep(0.00001)
     GPIO.output(TRIG, False)
 
     start_time = time.time()
-    timeout = start_time + 0.04  # 40ms timeout
+    timeout = start_time + 0.04
 
     while GPIO.input(ECHO) == 0:
         start_time = time.time()
         if start_time > timeout:
             return None
+
     stop_time = time.time()
     while GPIO.input(ECHO) == 1:
         stop_time = time.time()
@@ -69,139 +72,100 @@ def get_distance():
     distance = ((stop_time - start_time) * 34300) / 2
     return distance
 
-def human_detected():
-    """Detect number of people using YOLOv8. Returns 0 if camera fails."""
 
-    camera = cv2.VideoCapture("http://192.168.142.83:8080/video")  # IP camera stream
-
+def get_people_count():
     try:
-        ret, frame = camera.read()
-        if not ret:
-            camera.release()
-            return 0   # no frame → no people
-
-        results = model(frame, verbose=False)
-
-        people_count = 0
-
-        for box in results[0].boxes:
-            cls = int(box.cls[0])
-            label = model.names[cls]
-
-            if label.lower() == "person":
-                people_count += 1
-
-        camera.release()
-        return people_count
-
-    except Exception as e:
-        print(f"YOLO error: {e}")
-        camera.release()
+        r = requests.get("http://192.168.142.220:5005/detect", timeout=2)
+        data = r.json()
+        return data.get("people", 0)
+    except:
+        print("Error: YOLO backend unreachable.")
         return 0
 
+
 def read_temperature(retries=3):
-    """Read DHT22 temperature with retries. Returns None if all fail."""
     for _ in range(retries):
         try:
             temp = dht_sensor.temperature
             if temp is not None:
                 return temp
-        except RuntimeError:
+        except:
+            print("Error: DHT22 read failed.")
             time.sleep(0.2)
     return None
+
+
+def calc_fan_duty(temp_c: float, num_people: int, avg_distance_cm: float):
+    TEMP_CUTOFF = 25.0
+    TEMP_MAX = 35.0
+    MIN_DUTY = 10
+    MAX_DISTANCE_CM = 200
+    MAX_PEOPLE_CAN_COVER = 3
+
+    temp_range = TEMP_MAX - TEMP_CUTOFF
+    current_temp_diff = temp_c - TEMP_CUTOFF
+
+    duty_from_temp = MIN_DUTY
+    if current_temp_diff > temp_range:
+        duty_from_temp = 100
+    elif current_temp_diff > 0:
+        duty_from_temp = (current_temp_diff / temp_range) * 40
+
+    PERSON_SCALING_PER_HEAD = (60 / MAX_PEOPLE_CAN_COVER) * (avg_distance_cm / MAX_DISTANCE_CM) ** 0.5
+    duty_from_people = num_people * PERSON_SCALING_PER_HEAD
+
+    final_duty = duty_from_temp + duty_from_people
+    return int(min(final_duty, 100))
+
+
+def run_detection():
+    global last_detected_time, fan_last_duty
+    last_detected_time = time.time()
+
+    dist = get_distance()
+    person_here = get_people_count()
+    temperature = read_temperature()
+
+    if dist is None:
+        dist = 9999
+
+    duty_cycle = 0
+    if temperature and temperature > 27 and int(person_here) and dist < 300:
+        duty_cycle = calc_fan_duty(temperature, person_here, dist)
+
+    # Smooth changes
+    while abs(duty_cycle - fan_last_duty) > 10:
+        fan_last_duty += 10 if duty_cycle > fan_last_duty else -10
+        fan_pwm.ChangeDutyCycle(fan_last_duty)
+        time.sleep(0.2)
+
+    if fan_last_duty < 10:
+        fan_pwm.ChangeDutyCycle(duty_cycle)
+
+    fan_last_duty = duty_cycle
+    print(f"Temp={temperature}°C | Dist={dist:.1f}cm | People={person_here} | Fan={duty_cycle}%")
 
 # -------------------------------
 # Main loop
 # -------------------------------
-
-def calc_fan_duty(temp_c: float, num_people: int, avg_distance_cm: float):
-
-    TEMP_CUTOFF = 27.0          # Below this temperature, fan stays off
-    TEMP_MAX = 35.0             # Max temperature for full fan speed
-    MIN_DUTY = 10               # Minimum fan speed when running
-    MAX_DISTANCE_CM = 400       # If people are farther than this, fan stays off
-    MAX_PEOPLE_CAN_COVER = 3    # Scaling is designed for maximum 3 people
-
-    # --- Conditions where the fan should be OFF ---
-    if temp_c <= TEMP_CUTOFF or num_people == 0 or avg_distance_cm > MAX_DISTANCE_CM:
-        return 0
-
-    # Temperature difference from the cutoff
-    temp_range = TEMP_MAX - TEMP_CUTOFF
-    current_temp_diff = temp_c - TEMP_CUTOFF
-
-    # Base fan speed depending only on temperature
-    base_duty = MIN_DUTY        # Start with minimum
-    if current_temp_diff >= temp_range:
-        base_duty = 100         # Full speed at very high temperature
-    elif current_temp_diff > 0:
-        base_duty = (current_temp_diff / temp_range) * 100
-
-    # Make sure base duty is not less than MIN_DUTY
-    base_duty = max(base_duty, MIN_DUTY)
-
-    # Extra speed added per person depending on distance
-    PERSON_SCALING_PER_HEAD = (100 - MIN_DUTY) / MAX_PEOPLE_CAN_COVER * (avg_distance_cm / MAX_DISTANCE_CM)
-
-    # Add scaling for additional people (first person already counted)
-    scaling_factor = max(0, num_people - 1) * PERSON_SCALING_PER_HEAD
-
-    # Final fan speed
-    final_duty = base_duty + scaling_factor
-
-    # Limit to 100%
-    final_duty = int(min(final_duty, 100))
-
-    return final_duty
-
-def run_detection():
-    global last_detected_time,temperature
-    last_detected_time = time.time()
-    dist = get_distance()
-    person_here = human_detected()
-    # Fan control logic
-    duty_cycle = 0
-    if temperature and temperature > 27 and person_here and dist and dist < 300:
-        # Scale fan speed between 28°C → 10% and 37°C → 100%
-        duty_cycle = calc_fan_duty(temperature,person_here,dist)
-
-    # Smooth fan changes by limiting sudden jumps
-    current_dc = getattr(fan_pwm, "current_duty", 0)
-    while abs(duty_cycle - current_dc) > 20:  # limit jump to 20%
-        duty_cycle = current_dc + (20 if duty_cycle > current_dc else -20)
-        fan_pwm.ChangeDutyCycle(duty_cycle)
-        current_dc = duty_cycle  # store last duty
-        time.sleep(0.4)
-
-
-    print(
-        f"Temp={temperature}C | Dist={dist}cm | Human={person_here} | Fan Duty={duty_cycle}%")
-
-
-
 try:
+    print("System Ready.")
     while True:
-
         current_time = time.time()
-
-        # Read sensors
-        temperature = read_temperature()
-
         motion_detected = GPIO.input(PIR_PIN)
 
-        if (current_time - last_detected_time > recheck_interval) or motion_detected:
-            print("Running Detection")
+        if motion_detected:
+            run_detection()
+        elif current_time - last_detected_time > recheck_interval:
             run_detection()
 
-
-
-
-        time.sleep(2)
+        time.sleep(1)
 
 except KeyboardInterrupt:
-    print("Exiting...")
+    print("Shutting down...")
+    pass
 
 finally:
     fan_pwm.stop()
     GPIO.cleanup()
-    cv2.destroyAllWindows()
+    print("GPIO Cleaned.")
